@@ -2,6 +2,7 @@ use crate::rt;
 
 use std::ops;
 use std::sync::{LockResult, TryLockError, TryLockResult};
+use std::sync::atomic::Ordering;
 
 /// Mock implementation of `std::sync::Mutex`.
 #[derive(Debug)]
@@ -22,7 +23,7 @@ impl<T> Mutex<T> {
     pub fn new(data: T) -> Mutex<T> {
         Mutex {
             data: std::sync::Mutex::new(data),
-            object: rt::Mutex::new(true),
+            object: rt::Mutex::new(Ordering::SeqCst),
         }
     }
 }

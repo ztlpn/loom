@@ -133,18 +133,13 @@ macro_rules! debug {
     };
 }
 
-macro_rules! dbg {
-    ($($t:tt)*) => {
-        $($t)*
-    };
-}
-
 pub mod alloc;
 pub mod cell;
 pub mod model;
 mod rt;
 pub mod sync;
 pub mod thread;
+pub mod util;
 
 #[doc(inline)]
 pub use crate::model::model;

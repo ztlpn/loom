@@ -1,7 +1,7 @@
 use crate::rt::object::{self, Object};
 use crate::rt::{thread, Access, Synchronize};
 
-use std::sync::atomic::Ordering::{Acquire, Release};
+use std::sync::atomic::Ordering;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub(crate) struct Mutex {
@@ -10,8 +10,12 @@ pub(crate) struct Mutex {
 
 #[derive(Debug)]
 pub(super) struct State {
-    /// If the mutex should establish sequential consistency.
-    seq_cst: bool,
+    /// Ordering established by the mutex. Options are:
+    ///
+    /// - Relaxed
+    /// - AcqRel
+    /// - SeqCst
+    ordering: Ordering,
 
     /// `Some` when the mutex is in the locked state. The `thread::Id`
     /// references the thread that currently holds the mutex.
@@ -25,10 +29,17 @@ pub(super) struct State {
 }
 
 impl Mutex {
-    pub(crate) fn new(seq_cst: bool) -> Mutex {
+    pub(crate) fn new(ordering: Ordering) -> Mutex {
+        match ordering {
+            Ordering::Relaxed |
+                Ordering::AcqRel |
+                Ordering::SeqCst => {}
+            _ => panic!("invalid mutex ordering; {:?}", ordering),
+        }
+
         super::execution(|execution| {
             let obj = execution.objects.insert_mutex(State {
-                seq_cst,
+                ordering,
                 lock: None,
                 last_access: None,
                 synchronize: Synchronize::new(execution.max_threads),
@@ -52,19 +63,19 @@ impl Mutex {
         super::execution(|execution| {
             let state = self.get_state(&mut execution.objects);
 
+            let thread_id = execution.threads.active_id();
+
             // Release the lock flag
             state.lock = None;
 
             state
                 .synchronize
-                .sync_store(&mut execution.threads, Release);
+                .sync_store(&mut execution.threads, state.release_ordering());
 
-            if state.seq_cst {
+            if state.is_seq_cst() {
                 // Establish sequential consistency between the lock's operations.
                 execution.threads.seq_cst();
             }
-
-            let thread_id = execution.threads.active_id();
 
             for (id, thread) in execution.threads.iter_mut() {
                 if id == thread_id {
@@ -95,9 +106,9 @@ impl Mutex {
             // Set the lock to the current thread
             state.lock = Some(thread_id);
 
-            dbg!(state.synchronize.sync_load(&mut execution.threads, Acquire));
+            state.synchronize.sync_load(&mut execution.threads, state.acquire_ordering());
 
-            if state.seq_cst {
+            if state.is_seq_cst() {
                 // Establish sequential consistency between locks
                 execution.threads.seq_cst();
             }
@@ -139,5 +150,26 @@ impl State {
 
     pub(crate) fn set_last_access(&mut self, access: Access) {
         self.last_access = Some(access);
+    }
+
+    fn is_seq_cst(&self) -> bool {
+        match self.ordering {
+            Ordering::SeqCst => true,
+            _ => false,
+        }
+    }
+
+    fn acquire_ordering(&self) -> Ordering {
+        match self.ordering {
+            Ordering::Relaxed => Ordering::Relaxed,
+            _ => Ordering::Acquire,
+        }
+    }
+
+    fn release_ordering(&self) -> Ordering {
+        match self.ordering {
+            Ordering::Relaxed => Ordering::Relaxed,
+            _ => Ordering::Release,
+        }
     }
 }

@@ -2,6 +2,7 @@ use crate::rt;
 use crate::thread;
 
 use std::cell::RefCell;
+use std::sync::atomic::Ordering;
 use std::task::Waker;
 
 /// Mock implementation of `tokio::sync::AtomicWaker`.
@@ -16,7 +17,7 @@ impl AtomicWaker {
     pub fn new() -> AtomicWaker {
         AtomicWaker {
             waker: RefCell::new(None),
-            object: rt::Mutex::new(false),
+            object: rt::Mutex::new(Ordering::AcqRel),
         }
     }
 
