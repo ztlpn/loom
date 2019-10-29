@@ -2,41 +2,55 @@
 
 use crate::rt::{thread, Execution};
 
-use generator::{self, Generator, Gn};
+use context::{Context, Transfer};
+use context::stack::ProtectedFixedSizeStack;
 use scoped_tls::scoped_thread_local;
 use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::fmt;
 
 pub(crate) struct Scheduler {
     /// Threads
     threads: Vec<Thread>,
 
-    next_thread: usize,
+    // Pending functions
+    pending: Vec<Option<Box<dyn FnOnce()>>>,
 
-    queued_spawn: VecDeque<Box<dyn FnOnce()>>,
+    next_thread: usize,
 }
 
-type Thread = Generator<'static, Option<Box<dyn FnOnce()>>, ()>;
+// type Thread = Generator<'static, Option<Box<dyn FnOnce()>>, ()>;
+struct Thread {
+    _stack: ProtectedFixedSizeStack,
+    transfer: Option<Transfer>,
+}
 
 scoped_thread_local! {
     static STATE: RefCell<State<'_>>
 }
 
 struct State<'a> {
+    // Execution
     execution: &'a mut Execution,
-    queued_spawn: &'a mut VecDeque<Box<dyn FnOnce()>>,
+
+    // queued_spawn: &'a mut VecDeque<Box<dyn FnOnce()>>,
+    transfer: Option<Transfer>,
+
+    pending: &'a mut [Option<Box<dyn FnOnce()>>],
+
+    // Next thread
+    next_thread: &'a mut usize,
 }
 
 impl Scheduler {
     /// Create an execution
     pub(crate) fn new(capacity: usize) -> Scheduler {
         let threads = spawn_threads(capacity);
+        let pending = (0..capacity).map(|_| None).collect();
 
         Scheduler {
             threads,
-            next_thread: 0,
-            queued_spawn: VecDeque::new(),
+            pending,
+            next_thread: 1,
         }
     }
 
@@ -50,12 +64,25 @@ impl Scheduler {
 
     /// Perform a context switch
     pub(crate) fn switch() {
-        generator::yield_with(());
+        let transfer = STATE.with(|state| {
+            state.borrow_mut().transfer.take().unwrap()
+        });
+
+        let transfer = unsafe { transfer.context.resume(0) };
+
+        STATE.with(|state| {
+            state.borrow_mut().transfer = Some(transfer);
+        });
     }
 
     pub(crate) fn spawn(f: Box<dyn FnOnce()>) {
         STATE.with(|state| {
-            state.borrow_mut().queued_spawn.push_back(f);
+            let mut state = state.borrow_mut();
+
+            let thread_id = *state.next_thread;
+            *state.next_thread += 1;
+
+            state.pending[thread_id] = Some(f);
         });
     }
 
@@ -63,9 +90,8 @@ impl Scheduler {
     where
         F: FnOnce() + Send + 'static,
     {
+        self.pending[0] = Some(Box::new(f));
         self.next_thread = 1;
-        self.threads[0].set_para(Some(Box::new(f)));
-        self.threads[0].resume();
 
         loop {
             if !execution.threads.is_active() {
@@ -73,29 +99,31 @@ impl Scheduler {
             }
 
             let active = execution.threads.active_id();
-
             self.tick(active, execution);
-
-            while let Some(th) = self.queued_spawn.pop_front() {
-                let thread_id = self.next_thread;
-                self.next_thread += 1;
-
-                self.threads[thread_id].set_para(Some(th));
-                self.threads[thread_id].resume();
-            }
         }
     }
 
     fn tick(&mut self, thread: thread::Id, execution: &mut Execution) {
         let state = RefCell::new(State {
             execution: execution,
-            queued_spawn: &mut self.queued_spawn,
+            transfer: None,
+            pending: &mut self.pending,
+            next_thread: &mut self.next_thread,
         });
 
         let threads = &mut self.threads;
 
         STATE.set(unsafe { transmute_lt(&state) }, || {
-            threads[thread.as_usize()].resume();
+            let thread_id = thread.as_usize();
+
+            let transfer = threads[thread_id].transfer.take().unwrap();
+            let transfer = unsafe { transfer.context.resume(thread_id) };
+
+            if transfer.data == 1 {
+                panic!();
+            }
+
+            threads[thread_id].transfer = Some(transfer);
         });
     }
 }
@@ -103,25 +131,53 @@ impl Scheduler {
 impl fmt::Debug for Scheduler {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt.debug_struct("Schedule")
-            .field("threads", &self.threads)
             .finish()
     }
 }
 
 fn spawn_threads(n: usize) -> Vec<Thread> {
-    (0..n)
-        .map(|_| {
-            let mut g = Gn::new(move || {
-                loop {
-                    let f: Option<Box<dyn FnOnce()>> = generator::yield_(()).unwrap();
-                    generator::yield_with(());
-                    f.unwrap()();
-                }
+    use std::panic;
 
-                // done!();
+    extern "C" fn context_fn(mut t: Transfer) -> ! {
+        let thread_id = t.data;
+
+        loop {
+            let f = STATE.with(|state| {
+                let mut state = state.borrow_mut();
+
+                state.transfer = Some(t);
+                state.pending[thread_id].take().unwrap()
             });
-            g.resume();
-            g
+
+            let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                f();
+            }));
+
+            t = STATE.with(|state| {
+                let mut state = state.borrow_mut();
+                state.transfer.take().unwrap()
+            });
+
+            if res.is_err() {
+                unsafe { t.context.resume(1) };
+                break;
+            } else {
+                t = unsafe { t.context.resume(0) };
+            }
+        }
+
+        unreachable!();
+    }
+
+    (0..n)
+        .map(|i| unsafe {
+            let stack = ProtectedFixedSizeStack::default();
+            let transfer = Transfer::new(Context::new(&stack, context_fn), i);
+
+            Thread {
+                _stack: stack,
+                transfer: Some(transfer),
+            }
         })
         .collect()
 }
